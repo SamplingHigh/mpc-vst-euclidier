@@ -21,6 +21,8 @@ def get(key):
         return str(state[key])
     if key == "transport":
         return "RUN 120"
+    if key == "pid":
+        return str(os.getpid())
     if key == "fired":
         return str(fired["n"])
     if key.startswith("sel_"):
