@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "params.h"
@@ -45,6 +46,14 @@ static intptr_t host(AEffect *e, int32_t op, int32_t idx, intptr_t v, void *p, f
     return 0;
 }
 
+static int engine_get(const char *sock, const char *key) {   /* an int the stand-in engine reports (-1: no answer) */
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX; strncpy(a.sun_path, sock, sizeof a.sun_path - 1);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
+    char q[64]; snprintf(q, sizeof q, "GET %s\n", key); send(fd, q, strlen(q), 0);
+    char r[32] = {0}; int n = recv(fd, r, sizeof r - 1, 0); close(fd);
+    return n > 0 && strncmp(r, "ERR", 3) ? atoi(r) : -1;
+}
 static int engine_fired(const char *sock) {   /* how often the stand-in engine had a write-only trigger SET (-1: no answer) */
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX; strncpy(a.sun_path, sock, sizeof a.sun_path - 1);
@@ -231,6 +240,25 @@ int main(void) {
         printf("restoring an old chunk fired %d engine trigger(s) (expect 0)\n", after - before);
         if (before < 0 || after != before) { printf("FAIL restore fired write-only triggers\n"); fails++; }
         (void)n0;
+    }
+
+    /* the engine dies mid-song (on a Force it went silent after a few bars and only a plugin reload brought it back): the
+     * plugin must start a new one by itself and hand it the lane settings it had */
+    {
+        char sock[96]; snprintf(sock, sizeof sock, "/tmp/euclidier_vst_%d_1.sock", (int)getpid());   /* instance b */
+        int isteps = -1;
+        for (int i = 0; i < NPARAMS; i++) if (!strcmp(PARAMS[i].key, "l2_steps")) isteps = i;
+        if (isteps >= 0) b->setP(b, isteps, b->getP(b, isteps) > 0.5f ? 0.2f : 0.8f);
+        usleep(400000);
+        int want = engine_get(sock, "l2_steps"), pid0 = engine_get(sock, "pid");
+        if (pid0 > 0) kill(pid0, SIGKILL);
+        int pid1 = -1;
+        for (int k = 0; k < 120 && (pid1 <= 0 || pid1 == pid0); k++) { usleep(50000); b->pr(b, 0, out, 128); pid1 = engine_get(sock, "pid"); }
+        usleep(300000);
+        int got = engine_get(sock, "l2_steps");
+        printf("engine killed (pid %d) -> restarted as pid %d, l2_steps %d (expect %d)\n", pid0, pid1, got, want);
+        if (pid0 <= 0 || pid1 <= 0 || pid1 == pid0) { printf("FAIL engine not restarted after it died\n"); fails++; }
+        if (got != want) { printf("FAIL restarted engine lost the lane settings\n"); fails++; }
     }
 
     /* chunk round-trip */

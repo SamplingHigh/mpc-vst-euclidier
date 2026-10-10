@@ -195,6 +195,8 @@ struct Plugin {
     std::string text[NPARAMS];            /* string_display params (lane info) */
     std::atomic<float> told[NPARAMS];     /* what the host last knew for each param (-1: nothing yet); a cache change that differs is pushed */
     std::atomic<bool> playing{false};
+    std::atomic<bool> resync{false};   /* engine was restarted: re-announce Start + song position on the next block */
+    int ctrl_fails = 0;                /* consecutive failed health checks (worker thread) */
 
     /* Cache + async worker: setParameter/getParameter/effGetParamDisplay only
      * ever touch `cache` (see file header comment). */
@@ -362,6 +364,7 @@ static void poll_views(Plugin *w, int tick) {
  * just the one key SET), re-GETs every param to catch what the engine changed
  * behind our back. Runs entirely off setParameter/getParameter's caller thread.
  * ------------------------------------------------------------------------- */
+static void engine_watchdog(Plugin *w);
 static void io_worker(Plugin *w) {
     std::unique_lock<std::mutex> lk(w->qmu);
     for (int tick = 0;; tick++) {
@@ -394,6 +397,7 @@ static void io_worker(Plugin *w) {
                 w->cache[i].store(get_norm_blocking(w->sockpath, i));
             }
         }
+        if (tick % 33 == 0) engine_watchdog(w);   /* ~1 s */
         poll_views(w, tick);
         lk.lock();
     }
@@ -439,7 +443,14 @@ static bool spawn_engine(Plugin *w) {
     args.push_back(nullptr);
     char **argv = args.data();
     pid_t pid;
-    int rc = posix_spawn(&pid, bin, nullptr, nullptr, argv, envp.data());
+    /* stdout/stderr to /dev/null: MPC's own may be a pipe nobody drains (a full one blocks the engine mid-note) or one
+     * that closes (SIGPIPE kills it) */
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    int rc = posix_spawn(&pid, bin, &fa, nullptr, argv, envp.data());
+    posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) { LOG("[euclidier_vst] posix_spawn failed: %s\n", strerror(rc)); return false; }
     w->child = pid;
     LOG("[euclidier_vst] spawned engine pid=%d sock=%s\n", (int)pid, w->sockpath.c_str());
@@ -569,6 +580,7 @@ static void feed_transport(Plugin *w, int32_t frames) {
             w->sent_bpm100 = b100;
         }
     }
+    if (w->resync.exchange(false) && playing) w->grid.need_sync = w->grid.need_start = true;
     AlsaClock clk{w};
     w->grid.block(clk, playing, ti ? ti->ppqPos : 0.0, ti ? ti->tempo : 120.0, ti ? ti->sampleRate : 44100.0, frames);
 }
@@ -716,6 +728,50 @@ static float getParameter(AEffect *e, int32_t i) {
     Plugin *w = (Plugin *)e->object;
     if (i < 0 || i >= NPARAMS) return 0.0f;
     return popup_is(i) ? w->open[i] : w->cache[i].load();
+}
+
+/* ---------------------------------------------------------------------------
+ * Engine watchdog (worker thread, ~1 s): if the engine process has exited, or stopped answering its control socket
+ * for 5 s, start a fresh one and hand it everything the plugin knows -- every param, the host tempo, and a Start +
+ * song position on the next block -- so the sequence picks up again instead of staying silent until a reload.
+ * ------------------------------------------------------------------------- */
+static void engine_watchdog(Plugin *w) {
+    if (w->child <= 0) return;
+    int st;
+    bool dead = waitpid(w->child, &st, WNOHANG) == w->child;
+    if (!dead) {
+        std::string r;
+        w->ctrl_fails = ctrl_request(w->sockpath, "GET transport", r) ? 0 : w->ctrl_fails + 1;
+        if (w->ctrl_fails < 5) return;
+        LOG("[euclidier_vst] engine pid=%d stopped answering: restarting it\n", (int)w->child);
+        kill(w->child, SIGKILL);
+        waitpid(w->child, &st, 0);
+    } else {
+        LOG("[euclidier_vst] engine pid=%d exited (%s %d): restarting it\n", (int)w->child,
+            WIFSIGNALED(st) ? "signal" : "status", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
+    }
+    w->child = -1;
+    w->ctrl_fails = 0;
+#ifndef NO_ALSA
+    w->dest_client = -1;   /* the new engine's ALSA port: looked up again on the next clock byte */
+#endif
+    unlink(w->sockpath.c_str());
+    if (!spawn_engine(w)) return;
+    std::string reply;
+    /* same order a project restore uses: sel, then lane modes, then the rest */
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < NPARAMS; i++) {
+            const char *k = PARAMS[i].key;
+            if (PARAMS[i].momentary || popup_is(i) || is_virtual(i) || is_trigger_key(k)) continue;
+            size_t L = std::strlen(k);
+            int prio = !std::strcmp(k, "sel") ? 0 : (L > 5 && !std::strcmp(k + L - 5, "_mode")) ? 1 : 2;
+            if (prio != pass) continue;
+            char buf[32];
+            norm_to_str(&PARAMS[i], w->cache[i].load(), buf, sizeof buf);
+            ctrl_request(w->sockpath, std::string("SET ") + k + " " + buf, reply);
+        }
+    if (w->sent_bpm100 > 0) ctrl_request(w->sockpath, "SET host_bpm " + std::to_string(w->sent_bpm100), reply);
+    w->resync.store(true);
 }
 
 static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void *p, float o) {

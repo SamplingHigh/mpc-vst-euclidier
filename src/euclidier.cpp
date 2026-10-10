@@ -960,7 +960,8 @@ void clockStop()
 
 unsigned long long now() // current time since epoch in ms
 {
-    return (unsigned long long)duration_cast<milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    // steady clock: the wall clock can be set (NTP) while playing, and a jump back would hold every note-off for that long
+    return (unsigned long long)duration_cast<milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     return duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count();
 }
 
@@ -991,7 +992,7 @@ void sendTicks() // send midi pulse to all sequencers
 
 long long getUS() // gets time since epch in microseconds
 {
-    auto t1 = std::chrono::system_clock::now();
+    auto t1 = std::chrono::steady_clock::now(); // not the wall clock: see now()
     long long us = duration_cast<microseconds>(t1.time_since_epoch()).count();
     return us;
 }
