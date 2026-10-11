@@ -79,6 +79,20 @@ int main() {
       double want = (blocks - 1) * blk;   // the engine's tick must equal the host position (in pulses) again
       printf("dropped pulse: engine tick %ld vs host ppq*24 %.1f\n", en.tick, want * 24.0);
       CHECK(std::fabs(en.tick - want * 24.0) <= 2.0, "engine never re-synced: %ld vs %.1f", en.tick, want * 24.0); }
+    // 5. tempo change: the host's ppq steps back ~0.07 beat, crawls, then lurches ahead. No pulse may repeat or go backwards.
+    int lurch_bad = 0; for (long T = 1000; T < 1060; T++) { TransportGrid g; Engine en; double ph = 0; std::vector<long> all; bool ok = true;
+      for (long k = 0; k < 6000; k++) {
+          if (k < T) ph = k * ppb();
+          else if (k == T) ph = T * ppb() - 0.07;
+          else if (k < T + 150) ph += ppb() * 0.2;
+          else if (k == T + 150) ph += 0.4;
+          else ph += ppb();
+          en.fired.clear(); g.block(en, true, ph, tempo, sr, 128);
+          for (long t : en.fired) { if (!all.empty() && t <= all.back()) ok = false; all.push_back(t); }
+      }
+      if (!ok) lurch_bad++; }
+    printf("tempo lurch: %d of 60 phases repeated/reversed a pulse\n", lurch_bad);
+    CHECK(lurch_bad == 0, "pulses repeated across the tempo change");
     printf("%s\n", fails ? "GRID FAILED" : "GRID OK");
     return fails ? 1 : 0;
 }
