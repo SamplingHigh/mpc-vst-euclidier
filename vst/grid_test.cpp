@@ -22,26 +22,28 @@ struct Engine {
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
 
-// Run blocks; pos(k) gives ppqPos at block k. Returns the steps (ticks % 6 == 0) seen, verifying each pulse sits in its block's interval.
+// Run blocks; pos(k) gives ppqPos at block k. Returns the steps (ticks % 6 == 0) seen, verifying each pulse sits in the block it is
+// sent with, [p, p + blk) (sent at its start: ahead of time, never a block late). L > 0: the host loops [0, L) and reports it, so a
+// pulse may also be the loop start's, L earlier. tol: the host's position jitter.
 static long run(TransportGrid &g, Engine &en, long blocks, double (*pos)(long), double tempo, double sr, int frames,
-                std::vector<long> *steps = nullptr, long drop_at = -1) {
+                std::vector<long> *steps = nullptr, long drop_at = -1, double L = 0.0, bool report_loop = true, double tol = 1e-6) {
     double blk = frames * tempo / (60.0 * sr);
     long nsteps = 0;
-    double prev = pos(0);
     for (long k = 0; k < blocks; k++) {
         double p = pos(k);
         if (k == drop_at) en.drop_next = 1;
         en.fired.clear();
-        g.block(en, true, p, tempo, sr, frames);
-        double lo = (p < prev) ? p - blk : prev, hi = p;   // interval this block is allowed to cover
+        g.block(en, true, p, tempo, sr, frames, 0.0, report_loop ? L : 0.0);
+        double lo = p - std::max(tol, 0.0021), hi = p + blk + tol;   // a jump re-covers 0.002 beat before p
         for (long t : en.fired) {
             double q = t / 24.0;
             // after the dropped pulse the engine is one tick late until the bar heal: tolerated for < 1 bar
-            if (drop_at >= 0 && k >= drop_at && k < drop_at + 4000) continue;
-            CHECK(q >= lo - 1e-6 && q < hi + 1e-6, "block %ld: pulse tick %ld = ppq %.4f outside [%.4f, %.4f)", k, t, q, lo, hi);
+            bool skip = drop_at >= 0 && k >= drop_at && k < drop_at + 4000;
+            if (!skip && report_loop)
+                CHECK((q >= lo && q < hi) || (L > 0 && q + L >= lo && q + L < hi),
+                      "block %ld: pulse tick %ld = ppq %.4f outside [%.4f, %.4f)", k, t, q, p, p + blk);
             if (t % 6 == 0) { nsteps++; if (steps) steps->push_back(t / 6); }
         }
-        prev = p;
     }
     return nsteps;
 }
@@ -49,18 +51,29 @@ static long run(TransportGrid &g, Engine &en, long blocks, double (*pos)(long), 
 static double sr = 44100.0, tempo = 128.0;
 static double ppb() { return tempo / 60.0 * 128.0 / sr; }
 static double loop4(long k) { return std::fmod(k * ppb(), 4.0); }          // 4-beat loop, wrap lands mid-block
+// as measured on a Force (MPC OS 3.9.1): block positions wobble by up to -0.0009/+0.0002 beat around k*blk
+static double jit(long k) { unsigned h = (unsigned)k * 2654435761u; return ((h >> 8) % 1101) / 1e6 - 0.0009; }
+static double loop4j(long k) { return std::fmod(k * ppb(), 4.0) + (k ? jit(k) : 0.0); }   // jitter on the wrapped position, as seen
 static double from33(long k) { return 3.3 + k * ppb(); }                   // start in the middle of a 16th
 static double locate(long k) { double p = k * ppb(); return p < 2.0 ? p : 40.0 + (p - 2.0); }   // jump forward at 2.0
 
 int main() {
-    // 1. loops: exactly 16 steps per 4-beat loop, forever, every one on the grid
-    { TransportGrid g; Engine en; en.started = false;
+    // 1. loops, as MPC reports them (cycleStart/End): exactly 16 steps per 4-beat loop, forever, every one on the grid
+    for (int j = 0; j < 2; j++) { TransportGrid g; Engine en;
       std::vector<long> steps;
       long blocks = (long)(4.0 * 50 / ppb());
-      long n = run(g, en, blocks, loop4, tempo, sr, 128, &steps);
-      printf("loop: %ld steps in %ld blocks (50 loops, expect 800, within 1)\n", n, blocks);
+      long n = run(g, en, blocks, j ? loop4j : loop4, tempo, sr, 128, &steps, -1, 4.0, true, j ? 0.001 : 1e-6);
+      printf("loop%s: %ld steps in %ld blocks (50 loops, expect 800, within 1)\n", j ? " (jittered ppq)" : "", n, blocks);
       CHECK(std::labs(n - 800) <= 1, "loop step count %ld", n);
       for (size_t i = 0; i < steps.size(); i++) CHECK(steps[i] % 16 == (long)(i + (steps[0] % 16)) % 16, "step order broke at %zu (%ld)", i, steps[i]); }
+    // 1b. a host that loops without reporting the loop: no doubled steps, and the engine follows the position again after each wrap
+    { TransportGrid g; Engine en; std::vector<long> steps;
+      long blocks = (long)(4.0 * 50 / ppb());
+      long n = run(g, en, blocks, loop4, tempo, sr, 128, &steps, -1, 4.0, false);
+      printf("unreported loop: %ld steps (expect 800, within 1)\n", n);
+      CHECK(std::labs(n - 800) <= 1, "unreported loop step count %ld", n);
+      double want = loop4(blocks - 1) + ppb();
+      CHECK(std::fabs(en.tick - want * 24.0) <= 1.0, "unreported loop: engine tick %ld vs %.1f", en.tick, want * 24.0); }
     // 2. start at ppq 3.3: the first step is the 16th boundary at 3.5 (n = 14), nothing before it
     { TransportGrid g; Engine en; std::vector<long> steps;
       run(g, en, (long)(4.0 / ppb()), from33, tempo, sr, 128, &steps);

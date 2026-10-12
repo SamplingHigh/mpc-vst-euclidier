@@ -107,7 +107,8 @@ enum {
     effGetVendorVersion = 49, effCanDo = 51, effGetVstVersion = 58,
 };
 enum { audioMasterAutomate = 0, audioMasterGetTime = 7, audioMasterUpdateDisplay = 42 };
-enum { kVstTransportPlaying = 1 << 1, kVstPpqPosValid = 1 << 9, kVstTempoValid = 1 << 10 };
+enum { kVstTransportPlaying = 1 << 1, kVstTransportCycleActive = 1 << 2, kVstPpqPosValid = 1 << 9, kVstTempoValid = 1 << 10,
+       kVstCyclePosValid = 1 << 12 };
 enum { effFlagsCanReplacing = 1 << 4, effFlagsProgramChunks = 1 << 5, effFlagsIsSynth = 1 << 8 };
 
 static FILE *g_log;
@@ -566,7 +567,7 @@ struct AlsaClock {
 };
 static void feed_transport(Plugin *w, int32_t frames) {
     VstTimeInfo *ti = (VstTimeInfo *)w->master(&w->fx, audioMasterGetTime, 0,
-                                                kVstTempoValid | kVstPpqPosValid, 0, 0);
+                                                kVstTempoValid | kVstPpqPosValid | kVstCyclePosValid, 0, 0);
     bool playing = ti && (ti->flags & kVstTransportPlaying);
     w->playing.store(playing);
     /* The engine times gates/ratchets from its BPM, which it can only estimate from pulse arrival times (a burst per block, whole
@@ -582,7 +583,9 @@ static void feed_transport(Plugin *w, int32_t frames) {
     }
     if (w->resync.exchange(false) && playing) w->grid.need_sync = w->grid.need_start = true;
     AlsaClock clk{w};
-    w->grid.block(clk, playing, ti ? ti->ppqPos : 0.0, ti ? ti->tempo : 120.0, ti ? ti->sampleRate : 44100.0, frames);
+    bool cycle = ti && (ti->flags & kVstTransportCycleActive) && (ti->flags & kVstCyclePosValid);   /* MPC's loop (transport_grid.h) */
+    w->grid.block(clk, playing, ti ? ti->ppqPos : 0.0, ti ? ti->tempo : 120.0, ti ? ti->sampleRate : 44100.0, frames,
+                  cycle ? ti->cycleStartPos : 0.0, cycle ? ti->cycleEndPos : 0.0);
 }
 
 /* ---------------------------------------------------------------------------
